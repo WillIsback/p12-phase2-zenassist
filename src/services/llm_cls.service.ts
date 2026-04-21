@@ -5,6 +5,9 @@ import { ALLOWED_TAGS } from '@/constants/tags';
 import { SYSTEM_PROMPT } from '@/constants/prompts';
 
 const isLocalInference = process.env.INFERENCE_MODE?.toUpperCase() === 'LOCAL';
+const LLM_TIMEOUT_MS = 12_000;
+const LLM_RATE_LIMIT_RETRIES = 1;
+const LLM_RATE_LIMIT_BACKOFF_MS = 1_500;
 
 const localModel = isLocalInference
   ? createOpenAICompatible({
@@ -31,6 +34,40 @@ function getProviderOptions() {
       guided_choice: [...ALLOWED_TAGS],
     },
   };
+}
+
+function sleep(ms: number) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getRetryAfterMs(responseHeaders: APICallError['responseHeaders']): number | null {
+  if (!responseHeaders) {
+    return null;
+  }
+
+  const rawRetryAfter = responseHeaders instanceof Headers
+    ? responseHeaders.get('retry-after')
+    : responseHeaders['retry-after'] ?? responseHeaders['Retry-After'];
+
+  if (!rawRetryAfter) {
+    return null;
+  }
+
+  const retryAfterSeconds = Number(rawRetryAfter);
+  if (Number.isFinite(retryAfterSeconds)) {
+    return Math.max(0, retryAfterSeconds * 1000);
+  }
+
+  const retryAfterDate = Date.parse(rawRetryAfter);
+  if (!Number.isNaN(retryAfterDate)) {
+    return Math.max(0, retryAfterDate - Date.now());
+  }
+
+  return null;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
 }
 
 function normalizeLabelOutput(rawLabel: string): string {
@@ -65,38 +102,60 @@ export async function classifyComplaint(complaintText: string): Promise<typeof A
   console.log('[classifyComplaint] calling LLM with prompt length:', complaintText.length);
   console.log('[classifyComplaint] inference mode:', isLocalInference ? 'LOCAL' : 'PREMIUM');
   console.log('[classifyComplaint] LLM_BASE_URL:', process.env.LLM_BASE_URL);
-  try {
-    const { text, request, response } = await generateText({
-      model: getModel(),
-      system: SYSTEM_PROMPT,
-      prompt: complaintText,
-      temperature: 0,
-      maxOutputTokens: 30,
-      providerOptions: getProviderOptions(),
-    });
-
-    // Debug: check the payload and the raw provider response.
-    console.log('[classifyComplaint] request body:', request.body);
-    console.log('[classifyComplaint] LLM raw response:', text);
-    console.log('[classifyComplaint] response body:', JSON.stringify(response.body).slice(0, 500));
-
-    const tag = mapLabel(text);
-    if (!tag) {
-      console.warn(`[mapLabel] Could not map LLM response "${text}" to any allowed tag`);
-    }
-    return tag;
-  } catch (error) {
-    if (error instanceof APICallError) {
-      const apiCallError = error as APICallError;
-      console.error('[classifyComplaint] LLM HTTP error:', {
-        statusCode: apiCallError.statusCode,
-        isRetryable: apiCallError.isRetryable,
-        responseBody: apiCallError.responseBody,
+  for (let attempt = 0; attempt <= LLM_RATE_LIMIT_RETRIES; attempt += 1) {
+    try {
+      const { text, request, response } = await generateText({
+        model: getModel(),
+        system: SYSTEM_PROMPT,
+        prompt: complaintText,
+        temperature: 0,
+        maxOutputTokens: 30,
+        providerOptions: getProviderOptions(),
+        abortSignal: AbortSignal.timeout(LLM_TIMEOUT_MS),
       });
-      return null;
-    }
 
-    console.error('[classifyComplaint] Unexpected LLM error:', error);
-    throw error;
+      // Debug: check the payload and the raw provider response.
+      console.log('[classifyComplaint] request body:', request.body);
+      console.log('[classifyComplaint] LLM raw response:', text);
+      console.log('[classifyComplaint] response body:', JSON.stringify(response.body).slice(0, 500));
+
+      const tag = mapLabel(text);
+      if (!tag) {
+        console.warn(`[mapLabel] Could not map LLM response "${text}" to any allowed tag`);
+      }
+      return tag;
+    } catch (error) {
+      if (isAbortError(error)) {
+        console.error('[classifyComplaint] LLM request timed out after', LLM_TIMEOUT_MS, 'ms');
+        return null;
+      }
+
+      if (error instanceof APICallError) {
+        const apiCallError = error as APICallError;
+
+        if (apiCallError.statusCode === 429 && attempt < LLM_RATE_LIMIT_RETRIES) {
+          const retryAfterMs = getRetryAfterMs(apiCallError.responseHeaders) ?? LLM_RATE_LIMIT_BACKOFF_MS;
+          console.warn('[classifyComplaint] LLM rate limited, retrying after', retryAfterMs, 'ms', {
+            statusCode: apiCallError.statusCode,
+            isRetryable: apiCallError.isRetryable,
+            responseBody: apiCallError.responseBody,
+          });
+          await sleep(retryAfterMs);
+          continue;
+        }
+
+        console.error('[classifyComplaint] LLM HTTP error:', {
+          statusCode: apiCallError.statusCode,
+          isRetryable: apiCallError.isRetryable,
+          responseBody: apiCallError.responseBody,
+        });
+        return null;
+      }
+
+      console.error('[classifyComplaint] Unexpected LLM error:', error);
+      throw error;
+    }
   }
+
+  return null;
 }
