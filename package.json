@@ -8,8 +8,8 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "db:start": "docker-compose up -d",
-    "db:stop": "docker-compose down",
+    "db:start": "docker compose up -d",
+    "db:stop": "docker compose down",
     "db:reset": "node src/database/seed.ts"
   },
   "dependencies": {
