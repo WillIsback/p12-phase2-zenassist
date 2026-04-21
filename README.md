@@ -13,7 +13,7 @@
 Copier le fichier d'exemple et le remplir :
 
 ```bash
-cp .env.example .env
+cp .example.env .env
 ```
 
 ### Variables d'environnement
